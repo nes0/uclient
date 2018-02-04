@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <dlfcn.h>
 #include <getopt.h>
 #include <fcntl.h>
@@ -41,8 +42,12 @@
 #define LIB_EXT "so"
 #endif
 
-static const char *user_agent = "uclient-fetch";
+static const char *user_agent = "uclient-fetch-nes";
+static const char *extra_headers[10] = {};
+static int n_extra_headers = 0;
 static const char *post_data;
+static const char *put_data;
+static bool delete;
 static struct ustream_ssl_ctx *ssl_ctx;
 static const struct ustream_ssl_ops *ssl_ops;
 static int quiet = false;
@@ -226,8 +231,10 @@ static void header_done_cb(struct uclient *cl)
 			error_ret = 8;
 			break;
 		}
-	case 204:
 	case 200:
+	case 201:
+	case 203:
+	case 204:
 		if (no_output)
 			break;
 
@@ -312,6 +319,7 @@ static void check_resume_offset(struct uclient *cl)
 
 static int init_request(struct uclient *cl)
 {
+	const char **ptr = extra_headers;
 	int rc;
 
 	out_offset = 0;
@@ -328,18 +336,52 @@ static int init_request(struct uclient *cl)
 
 	msg_connecting(cl);
 
-	rc = uclient_http_set_request_type(cl, post_data ? "POST" : "GET");
+	if (post_data)
+		rc = uclient_http_set_request_type(cl, "POST");
+	else if (put_data)
+		rc = uclient_http_set_request_type(cl, "PUT");
+	else if (delete)
+		rc = uclient_http_set_request_type(cl, "DELETE");
+	else
+		rc = uclient_http_set_request_type(cl, "GET");
 	if (rc)
 		return rc;
 
 	uclient_http_reset_headers(cl);
 	uclient_http_set_header(cl, "User-Agent", user_agent);
+
+	while (*ptr) {
+		char *name;
+		char *p;
+		int n;
+
+		p = strchrnul(*ptr, ':');
+		n = (int)(p - *ptr);
+		name = malloc(n);
+		if (name) {
+			strncpy(name, *ptr, n);
+			name[n] = '\0';
+			while (*p && (*p == ':' || isblank(*p)))
+				p++;
+			uclient_http_set_header(cl, name, p);
+			free(name);
+		}
+		else {
+			fprintf(stderr, "Error allocating memory for '%s'\n", *ptr);
+		}
+		ptr++;
+	}
+
 	if (cur_resume)
 		check_resume_offset(cl);
 
 	if (post_data) {
 		uclient_http_set_header(cl, "Content-Type", "application/x-www-form-urlencoded");
 		uclient_write(cl, post_data, strlen(post_data));
+	}
+	else if (put_data) {
+		uclient_http_set_header(cl, "Content-Type", "application/x-www-form-urlencoded");
+		uclient_write(cl, put_data, strlen(put_data));
 	}
 
 	rc = uclient_request(cl);
@@ -453,7 +495,10 @@ static int usage(const char *progname)
 		"	--user=<user>			HTTP authentication username\n"
 		"	--password=<password>		HTTP authentication password\n"
 		"	--user-agent|-U <str>		Set HTTP user agent\n"
-		"	--post-data=STRING		use the POST method; send STRING as the data\n"
+		"	--header <str>			Add extra header to the request\n"
+		"	--post-data <str>		use the POST method; send STRING as the data\n"
+		"	--put-data <str>		use the PUT method; send STRING as the data\n"
+		"	--delete			use the DELETE method\n"
 		"	--spider|-s			Spider mode - only check file existence\n"
 		"	--timeout=N|-T N		Set connect/request timeout to N seconds\n"
 		"	--proxy=on|off|-Y on|off	Enable/disable env var configured proxy\n"
@@ -493,10 +538,10 @@ static void init_ustream_ssl(void)
 static int no_ssl(const char *progname)
 {
 	fprintf(stderr,
-	        "%s: SSL support not available, please install one of the "
-	        "libustream-ssl-* libraries as well as the ca-bundle and "
+		"%s: SSL support not available, please install one of the "
+		"libustream-ssl-* libraries as well as the ca-bundle and "
 		"ca-certificates packages.\n",
-	        progname);
+		progname);
 
 	return 1;
 }
@@ -507,7 +552,10 @@ enum {
 	L_USER,
 	L_PASSWORD,
 	L_USER_AGENT,
+	L_X_HEADER,
 	L_POST_DATA,
+	L_PUT_DATA,
+	L_DELETE,
 	L_SPIDER,
 	L_TIMEOUT,
 	L_CONTINUE,
@@ -522,7 +570,10 @@ static const struct option longopts[] = {
 	[L_USER] = { "user", required_argument },
 	[L_PASSWORD] = { "password", required_argument },
 	[L_USER_AGENT] = { "user-agent", required_argument },
+	[L_X_HEADER] = { "header", required_argument },
 	[L_POST_DATA] = { "post-data", required_argument },
+	[L_PUT_DATA] = { "put-data", required_argument },
+	[L_DELETE] = { "delete", no_argument },
 	[L_SPIDER] = { "spider", no_argument },
 	[L_TIMEOUT] = { "timeout", required_argument },
 	[L_CONTINUE] = { "continue", no_argument },
@@ -577,8 +628,17 @@ int main(int argc, char **argv)
 			case L_USER_AGENT:
 				user_agent = optarg;
 				break;
+			case L_X_HEADER:
+				extra_headers[n_extra_headers++] = optarg;
+				break;
 			case L_POST_DATA:
 				post_data = optarg;
+				break;
+			case L_PUT_DATA:
+				put_data = optarg;
+				break;
+			case L_DELETE:
+				delete = true;
 				break;
 			case L_SPIDER:
 				no_output = true;
